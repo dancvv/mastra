@@ -1,6 +1,8 @@
+import { createOpenAI } from '@ai-sdk/openai-v5';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { useLoopScenarioAimock } from '../../../loop/test-utils/aimock/aimock-scenario';
 import { DurableStepIds, AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import {
   DEFAULT_TIMEOUT_MS,
@@ -94,6 +96,103 @@ function toolScenario(kind: 'durable' | 'evented' | 'evented-fallback', runId: s
 }
 
 describe('restart harness', () => {
+  const getMock = useLoopScenarioAimock();
+
+  for (const kind of ['durable', 'evented'] as const) {
+    it(`${kind}: keeps per-entry fallback settings after recovery in a fresh graph (#27550)`, async () => {
+      const llm = getMock();
+      llm.on(
+        { endpoint: 'chat', model: 'gpt-4o-mini', hasToolResult: false },
+        { toolCalls: [{ id: 'call-wait', name: 'wait', arguments: {} }] },
+      );
+      llm.on(
+        { endpoint: 'chat', model: 'gpt-4o-mini', hasToolResult: true },
+        { error: { message: 'primary is down', type: 'server_error' }, status: 400 },
+      );
+      llm.on({ endpoint: 'chat', model: 'gpt-4o' }, { content: 'Recovered fallback response' });
+
+      const gate = createGate();
+      gates.push(gate);
+      const runId = `fallback-settings-${kind}`;
+      const scenario = createRestartScenario({
+        kind,
+        runId,
+        build: ({ core, generation }) => {
+          const openai = createOpenAI({ apiKey: 'test-key', baseURL: `${llm.url}/v1` });
+          return new core.Agent({
+            id: 'fallback-settings',
+            name: 'fallback-settings',
+            instructions: 'Call wait, then answer.',
+            errorProcessors: [],
+            model: [
+              {
+                id: 'primary',
+                model: openai.chat('gpt-4o-mini'),
+                maxRetries: 0,
+                modelSettings: { temperature: 0.1, topP: 0.5 },
+                providerOptions: { openai: { user: 'primary-user', store: false } },
+              },
+              {
+                id: 'fallback',
+                model: openai.chat('gpt-4o'),
+                maxRetries: 0,
+                modelSettings: { temperature: 0.9 },
+                providerOptions: { openai: { user: 'fallback-user' } },
+              },
+            ],
+            tools: {
+              wait: core.createTool({
+                id: 'wait',
+                description: 'Wait before answering.',
+                inputSchema: z.object({}),
+                execute: async () => {
+                  if (generation === 1) await gate.wait();
+                  return { ok: true };
+                },
+              }),
+            },
+          });
+        },
+      });
+      scenarios.push(scenario);
+      const original = await scenario.start(async ({ agent }) => {
+        const output = await agent.stream('hi', { runId, modelSettings: { temperature: 0.3, frequencyPenalty: 0.2 } });
+        await consumeText(output);
+      });
+      await gate.reached;
+      const checkpoint = await original.checkpoint();
+      llm.clearRequests();
+
+      try {
+        const recovered = await scenario.restart(checkpoint);
+        expect(recovered.streamErrors).toEqual([]);
+        expect(recovered.executionError).toBeUndefined();
+        expect(recovered.text).toBe('Recovered fallback response');
+        expect(llm.getRequests()).toHaveLength(2);
+        const [primary, fallback] = llm.getRequests();
+        expect(primary?.body).toMatchObject({
+          model: 'gpt-4o-mini',
+          temperature: 0.1,
+          top_p: 0.5,
+          frequency_penalty: 0.2,
+          user: 'primary-user',
+          store: false,
+        });
+        expect(fallback?.body).toMatchObject({
+          model: 'gpt-4o',
+          temperature: 0.9,
+          frequency_penalty: 0.2,
+          user: 'fallback-user',
+        });
+        expect(fallback?.body).not.toHaveProperty('top_p');
+        expect(fallback?.body).not.toHaveProperty('store');
+      } finally {
+        gate.release();
+        await original.driven;
+      }
+    }, 30_000);
+  }
+
   for (const kind of ['durable', 'evented'] as const) {
     it(`${kind}: recovers a run blocked in a tool at step 2 in a fresh graph`, async () => {
       const runId = `restart-${kind}-gate`;

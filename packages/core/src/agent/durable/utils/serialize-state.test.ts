@@ -180,6 +180,31 @@ describe('serializeModelList', () => {
     const result = serializeModelList([makeEntry('x')]);
     expect(result[0].maxRetries).toBe(3);
   });
+
+  it('preserves per-entry call settings through JSON without persisting headers', () => {
+    const settings = {
+      temperature: 0,
+      topP: 0.5,
+      maxOutputTokens: 64,
+      stopSequences: ['END'],
+      timeout: { stepMs: 1000, firstChunkMs: 500 },
+    };
+    const entries = serializeModelList([
+      {
+        ...makeEntry('primary', true),
+        modelSettings: { ...settings, headers: { authorization: 'private-key' } },
+        providerOptions: { openai: { store: false } },
+      },
+      makeEntry('fallback', true),
+    ]);
+
+    expect(JSON.parse(JSON.stringify(entries))).toEqual([
+      expect.objectContaining({
+        config: expect.objectContaining({ settings, providerOptions: { openai: { store: false } } }),
+      }),
+      expect.objectContaining({ config: expect.not.objectContaining({ settings: expect.anything() }) }),
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -78,12 +78,8 @@ export interface SerializableModelConfig {
   /** Original model string/config for resolution at runtime (e.g., 'openai/gpt-4o') */
   originalConfig?: string | Record<string, unknown>;
   /** Additional model settings */
-  settings?: {
-    temperature?: number;
+  settings?: SerializableModelSettings & {
     maxTokens?: number;
-    topP?: number;
-    frequencyPenalty?: number;
-    presencePenalty?: number;
     [key: string]: unknown;
   };
   /** Provider-specific options for the model call */
